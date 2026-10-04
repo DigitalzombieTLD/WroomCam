@@ -1,103 +1,82 @@
 # WroomCam
 
 ESP32-S3 firmware that acts as a **USB host for a UVC camera** (MJPEG) and serves it as a
-`multipart/x-mixed-replace` MJPEG stream over Wi-Fi.
+`multipart/x-mixed-replace` stream over Wi-Fi.
 
-> **Status:** written against the ESP-IDF / `espressif/usb_host_uvc` APIs but **not yet compiled and not
-> tested on hardware** (the authoring environment had no ESP-IDF toolchain or board). Expect to fix small
-> build issues on first compile; see [Validation](#validation).
+> **Status:** written against ESP-IDF / `espressif/usb_host_uvc` APIs. It has not yet been compiled or tested on hardware; validate with the build and smoke-test steps below.
 
-## Hardware
+## Board identification and USB wiring
 
-- Board: ESP32-S3-DevKitC-1 v1.1 (ESP32-S3-WROOM-1). The native USB pins are **GPIO19 (D-) and GPIO20 (D+)**.
-  The board has two USB-C connectors: one goes to the USB-to-UART bridge (flashing/serial log), the other
-  to the ESP32-S3 native USB. Check the silkscreen/the
-  [official user guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html),
-  because connector labels differ between documents/revisions. **The camera goes on the native USB port.**
-- **Host power (VBUS):** the official guide does not document the board's USB port as a 5 V *output* in host
-  mode, so do not assume it supplies the camera (that page could not be fetched while writing this, so
-  verify against the schematic). Use a proper USB-OTG/host adapter or cable and an **externally powered USB
-  hub**, or another safe 5 V source (shared ground) for the camera's VBUS. **Never power the camera from a GPIO.**
-  The camera in question draws about 128 mA.
-- Flashing/logs: use the UART port; run the camera from the native port. The native port can power the board
-  but you then cannot use it for both host and a PC at once.
-- **PSRAM:** DevKitC-1 variants differ (N8R8/N16R8 have octal PSRAM, R2 has quad, N4/N8 none). Defaults assume
-  octal PSRAM; boot continues without PSRAM (`CONFIG_SPIRAM_IGNORE_NOTFOUND`) and the firmware then uses
-  internal RAM and falls back to 320x240. For quad PSRAM, replace `CONFIG_SPIRAM_MODE_OCT=y` with
-  `CONFIG_SPIRAM_MODE_QUAD=y` in `sdkconfig.defaults`. Flash is set to 4 MB (works on every variant).
+The attached photo appears to show a third-party ESP32-S3-WROOM-1 development board, not an official Espressif DevKitC-1: it has a CH343P USB-to-serial bridge, two USB-C connectors, and a module marking that looks like **ESP32-S3-WROOM-1-N16R8**. If that module marking is accurate, it indicates 16 MB Quad-SPI flash and 8 MB Octal-SPI PSRAM; `sdkconfig.defaults` is configured accordingly. Confirm the full module label printed on the metal shield in case the image is illustrative or the board is a clone with a different module.
 
-## Performance expectations
+From the attached board image:
 
-The ESP32-S3 USB peripheral is **Full-Speed (12 Mbit/s)**; usable isochronous bandwidth is well under 1 MB/s,
-Espressif's UVC example reports around 0.5 MB/s. A camera may advertise 2048x1536 MJPEG, but that is
-a High-Speed USB 2.0 mode and will generally not work (or will not stream) on the S3. Start with 320x240 or
-640x480 @ 15 fps. Many cameras only expose Full-Speed alternate settings for small modes; if
-`stream_start failed` appears, the mode is not available at Full-Speed. Wi-Fi throughput, JPEG size and
-camera exposure also limit frame rate.
+- **Left USB-C connector:** labelled ESP32-S3 USB & OTG; use this native USB connector for the UVC camera.
+- **Right USB-C connector:** labelled USB to Serial; use this for flashing and serial logs.
+- Native USB D- is GPIO19 and D+ is GPIO20. The ESP32-S3 USB OTG peripheral is Full-Speed; it is not High-Speed USB.
+- A USB-C-to-USB-A host adapter/cable is needed to attach a USB camera. Check cable orientation and host-role wiring if the camera is not detected.
+
+The official Espressif DevKitC-1 v1.0 guide independently confirms the native port is a Full-Speed USB OTG interface and identifies GPIO19/20 as USB D-/D+. However, the photographed board is not necessarily the same PCB/schematic as the official DevKitC-1. Neither the photo nor the linked official DevKitC guide proves that this clone's OTG connector sources 5 V VBUS in host mode. Do not assume it powers the camera: use a properly powered USB host adapter/hub or safe 5 V VBUS supply with common ground, and **never power the camera from a GPIO**. Avoid tying two independent 5 V sources together or back-feeding a USB port. Camera VBUS power switching is not implemented by this firmware; stopping capture does not turn off camera power.
+
+Official board references:
+
+- [ESP32-S3-DevKitC-1 v1.0 user guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.0.html)
+- [ESP32-S3-DevKitC-1 v1.1 user guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html)
+- [ESP32-S3-WROOM-1 datasheet](https://documentation.espressif.com/esp32-s3-wroom-1_wroom-1u_datasheet_en.html)
+
+The photos/docs establish connector purpose and USB pins, not VBUS host power capability for this pictured third-party PCB. Inspect its exact schematic or measure VBUS safely before relying on it.
+
+## Performance and idle power
+
+The ESP32-S3 USB peripheral is **Full-Speed (12 Mbit/s)**. Actual UVC bandwidth is much lower than the signaling rate; begin with 320x240 or 640x480 MJPEG at 15 fps and increase gradually. Camera-advertised high-resolution modes may require USB High-Speed and may not be available through this host. The camera's frame size, bus mode, Wi-Fi throughput, and PSRAM/RAM determine achievable performance.
+
+Power behavior:
+
+- Wi-Fi remains connected so the HTTP stream can be requested, but uses `WIFI_PS_MIN_MODEM` while idle. This reduces radio activity with possible network-response latency.
+- When `/stream` has an active HTTP handler, the firmware disables Wi-Fi modem sleep for lower-latency delivery and signals the UVC supervisor to start capture.
+- When the stream client disconnects/times out, capture is stopped and the UVC stream is closed; Wi-Fi modem sleep is restored. The USB host remains installed so it can detect the camera and serve future requests.
+- This is not deep sleep: the ESP32 must keep Wi-Fi/HTTP available. The camera may still draw power from VBUS even after UVC capture stops. Full camera power-off needs a controllable VBUS load switch or power-switched hub, which this pictured board/firmware has not been verified to provide.
 
 ## Build
 
-Requires ESP-IDF **v5.4 or v5.5** (`main/idf_component.yml` pins `>=5.4.0,<5.6.0`) and
-`espressif/usb_host_uvc ~2.5.2` (downloaded automatically by the component manager; commit the generated
-`dependencies.lock` to pin exact versions).
+Requires ESP-IDF **v5.4 or v5.5** and `espressif/usb_host_uvc ~2.5.2` (resolved by ESP-IDF Component Manager).
 
 ```sh
 . $IDF_PATH/export.sh
-cp sdkconfig.secrets.example sdkconfig.secrets   # edit SSID / password (git-ignored)
+cp sdkconfig.secrets.example sdkconfig.secrets   # edit SSID/password; this file is ignored by git
 idf.py set-target esp32s3
 idf.py build
-idf.py -p <UART-PORT> flash monitor
+idf.py -p <USB-to-serial-port> flash monitor
 ```
 
-If you change `sdkconfig.defaults` / `sdkconfig.secrets` later, delete the generated `sdkconfig` (or use
-`idf.py menuconfig` -> *WroomCam*).
+If this exact board does not have the pictured N16R8 module, check the full module label and adjust `sdkconfig.defaults` accordingly. For example, a board with no PSRAM should not force octal PSRAM; the firmware has a 320x240 fallback but build-time PSRAM configuration must still match the module. When changing defaults/secrets after the initial build, remove generated `sdkconfig` or use `idf.py menuconfig`.
 
-## Configuration (menuconfig -> WroomCam, or `sdkconfig.secrets`)
+## Configuration
+
+Configure in `sdkconfig.secrets` (copy `sdkconfig.secrets.example`) or `idf.py menuconfig` under WroomCam:
 
 | Setting | Default |
 |---|---|
-| `WROOMCAM_WIFI_SSID` / `_PASSWORD` | placeholders `YOUR_WIFI_SSID` / `YOUR_WIFI_PASSWORD` |
-| `WROOMCAM_STATIC_IP` + `_IP_ADDR`, `_IP_GATEWAY`, `_IP_NETMASK`, `_IP_DNS` | off (DHCP) |
-| `WROOMCAM_CAM_WIDTH` / `_HEIGHT` / `_FPS` | 320 / 240 / 15, MJPEG |
-| `WROOMCAM_CAM_FRAME_BUF_KB` | 0 (auto, at least 32 KiB) |
-| `WROOMCAM_STALL_TIMEOUT_MS`, `_MAX_FAILURES`, `_BACKOFF_MIN_MS`, `_BACKOFF_MAX_MS` | 5000, 8, 1000, 15000 |
-| `WROOMCAM_HTTP_PORT`, `_HTTP_SEND_TIMEOUT_S`, `_HTTP_FRAME_WAIT_S` | 80, 5, 15 |
+| Wi-Fi SSID/password | placeholders; replace before use |
+| Static IPv4 address/gateway/netmask/DNS | DHCP by default; static optional |
+| Camera width/height/FPS | 320x240 @ 15 fps MJPEG |
+| Frame buffer size | auto; increase if the log reports frame overflow |
+| HTTP port | 80 |
 
-Increasing resolution: raise width/height/fps in steps (320x240 -> 640x480 -> 800x600 ...), keep the
-mode to one your camera lists as MJPEG, watch the log for `overflow`/`transfer error`, and raise
-`WROOMCAM_CAM_FRAME_BUF_KB` if frames overflow. Requires PSRAM above 320x240.
+Raise camera resolution/FPS in steps and check camera mode support and logs. USB Full-Speed means a mode advertised by the camera is not necessarily usable on the ESP32-S3. PSRAM is strongly recommended for larger JPEG frames.
 
 ## Use
 
-Open `http://<device-ip>/` (page embeds the stream) or `http://<device-ip>/stream`. The IP is printed in the
-serial log (`Got IP ...`). Streaming runs only while a viewer is connected. One viewer at a time: the
-ESP-IDF HTTP server handles a single stream handler, other connections wait.
+After boot, the serial log prints the assigned IP. Open `http://<device-ip>/` or `http://<device-ip>/stream`. Only one stream viewer is served at a time by this configuration of the ESP-IDF HTTP server.
 
-## Design notes
+## Recovery and validation
 
-- `uvc_source.c`: installs USB host + `espressif/usb_host_uvc`; frames are handed to HTTP **without copying**
-  (driver buffers, PSRAM if present) through a one-slot queue. A slow client causes the old frame to be dropped
-  and the newest kept, so buffering is bounded (3 driver buffers).
-- A supervisor task recovers from camera unplug, USB transfer-error bursts, stalls (no frames) and
-  open/start failures by stopping/closing/reopening the stream with exponential backoff. After
-  `WROOMCAM_MAX_FAILURES` consecutive failures (or if frames cannot be released) the chip restarts.
-  Panics and task-watchdog timeouts also reboot. An absent camera is waited for indefinitely, not counted as failure.
-- `wifi_manager.c`: station mode, DHCP or static IPv4, backoff reconnect, restart after many failures.
-- Bluetooth is disabled and SoftAP/enterprise Wi-Fi support are off in `sdkconfig.defaults`.
+The UVC supervisor retries camera open/start and recovers from disconnects, transfer errors, and frame stalls with backoff; repeated failures trigger a controlled chip restart. Wi-Fi reconnects with backoff. The firmware has not been compiled or tested on this specific third-party board, so validate before unattended use.
 
-## Validation
+1. Confirm serial logs show Wi-Fi connected and an IPv4 address.
+2. Connect a powered USB host adapter/hub and check for UVC camera detection.
+3. Request `/stream`; verify capture starts only after a client request and stops after the client closes or times out.
+4. Test multipart framing: `python3 tools/check_stream.py http://<device-ip>/stream 50`.
+5. Disconnect/reconnect the camera and Wi-Fi; check recovery logs.
 
-No automated tests are included (they need hardware). After flashing:
-
-1. Serial log should show `UVC device connected`, `Mode: MJPEG ...`, `Streaming started`.
-2. `python3 tools/check_stream.py http://<device-ip>/stream 50` checks boundaries, Content-Length and JPEG markers and prints fps.
-3. Unplug/replug the camera: log shows `Camera disconnected`, then streaming restarts. Open the stream in two
-   tabs / throttle a client to check that the device keeps running.
-
-## Troubleshooting
-
-- `Wi-Fi SSID is still the placeholder`: create `sdkconfig.secrets`, delete `sdkconfig`, rebuild.
-- `Waiting for UVC camera`: wrong USB port, no VBUS power, or a non-UVC camera/bad adapter.
-- `stream_start failed` / `ESP_ERR_NOT_FOUND`: mode unsupported at Full-Speed; try 320x240 or 640x480 @ 15 fps.
-- `Frame buffer overflow`: increase `WROOMCAM_CAM_FRAME_BUF_KB`.
-- Repeated reboots: check power quality/hub and the log line preceding `restarting`.
+Troubleshooting: no camera detection can indicate wrong connector, no VBUS, non-UVC camera, or host adapter/cable wiring. Frame overflow means increase configured buffer memory or lower the camera mode. Repeated resets require checking the preceding log line, camera power stability, and PSRAM/flash configuration.

@@ -5,6 +5,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "uvc_source.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "wifi";
@@ -14,8 +15,25 @@ static const char *TAG = "wifi";
 
 static esp_timer_handle_t s_retry_timer;
 static volatile bool s_has_ip;
+static volatile bool s_streaming_active;
 static unsigned s_fail_count;
 static uint32_t s_retry_delay_ms = RETRY_DELAY_MIN_MS;
+
+static void update_power_save(void)
+{
+    // Keep modem sleep enabled at idle; disable it only while delivering live video.
+    wifi_ps_type_t mode = (s_has_ip && s_streaming_active) ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM;
+    esp_err_t err = esp_wifi_set_ps(mode);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps: %s", esp_err_to_name(err));
+    }
+}
+
+void wifi_manager_set_streaming(bool active)
+{
+    s_streaming_active = active;
+    update_power_save();
+}
 
 bool wifi_manager_has_ip(void)
 {
@@ -34,6 +52,8 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *ev = data;
         s_has_ip = false;
+        uvc_source_set_network_ready(false);
+        update_power_save();
         s_fail_count++;
         ESP_LOGW(TAG, "Disconnected (reason %d), attempt %u, retry in %u ms",
                  ev->reason, s_fail_count, (unsigned)s_retry_delay_ms);
@@ -41,6 +61,8 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
             ESP_LOGE(TAG, "Too many failed Wi-Fi attempts, restarting");
             esp_restart();
         }
+        // A previous one-shot may still be pending if disconnect events arrive quickly.
+        (void)esp_timer_stop(s_retry_timer);
         esp_timer_start_once(s_retry_timer, (uint64_t)s_retry_delay_ms * 1000);
         s_retry_delay_ms = s_retry_delay_ms * 2 > RETRY_DELAY_MAX_MS ? RETRY_DELAY_MAX_MS : s_retry_delay_ms * 2;
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -49,6 +71,8 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         s_has_ip = true;
         s_fail_count = 0;
         s_retry_delay_ms = RETRY_DELAY_MIN_MS;
+        update_power_save();
+        uvc_source_set_network_ready(true);
     }
 }
 
@@ -57,19 +81,34 @@ static esp_err_t apply_static_ip(esp_netif_t *netif)
 {
     esp_netif_ip_info_t info = {0};
     esp_netif_dns_info_t dns = {0};
+    esp_err_t err;
 
     if (esp_netif_str_to_ip4(CONFIG_WROOMCAM_IP_ADDR, &info.ip) != ESP_OK ||
         esp_netif_str_to_ip4(CONFIG_WROOMCAM_IP_GATEWAY, &info.gw) != ESP_OK ||
         esp_netif_str_to_ip4(CONFIG_WROOMCAM_IP_NETMASK, &info.netmask) != ESP_OK ||
         esp_netif_str_to_ip4(CONFIG_WROOMCAM_IP_DNS, &dns.ip.u_addr.ip4) != ESP_OK) {
-        ESP_LOGE(TAG, "Invalid static IP settings, falling back to DHCP");
+        ESP_LOGE(TAG, "Invalid static IP settings; keeping DHCP enabled");
         return ESP_ERR_INVALID_ARG;
     }
     dns.ip.type = ESP_IPADDR_TYPE_V4;
 
-    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(netif));
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &info));
-    ESP_ERROR_CHECK(esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns));
+    err = esp_netif_dhcpc_stop(netif);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not stop DHCP client: %s; keeping DHCP enabled", esp_err_to_name(err));
+        return err;
+    }
+    err = esp_netif_set_ip_info(netif, &info);
+    if (err == ESP_OK) {
+        err = esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not apply static network settings: %s; restoring DHCP", esp_err_to_name(err));
+        esp_err_t dhcp_err = esp_netif_dhcpc_start(netif);
+        if (dhcp_err != ESP_OK) {
+            ESP_LOGE(TAG, "Could not restart DHCP client: %s", esp_err_to_name(dhcp_err));
+        }
+        return err;
+    }
     ESP_LOGI(TAG, "Static IP " IPSTR, IP2STR(&info.ip));
     return ESP_OK;
 }
@@ -86,7 +125,7 @@ esp_err_t wifi_manager_start(void)
     esp_netif_t *netif = esp_netif_create_default_wifi_sta();
 
 #ifdef CONFIG_WROOMCAM_STATIC_IP
-    (void)apply_static_ip(netif);  // on invalid settings DHCP stays enabled
+    (void)apply_static_ip(netif);  // parsing/application errors are logged; DHCP is retained/restored
 #endif
 
     const esp_timer_create_args_t targs = {.callback = retry_timer_cb, .name = "wifi_retry"};
@@ -107,6 +146,7 @@ esp_err_t wifi_manager_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));  // lowest latency for streaming
+    s_streaming_active = false;
+    update_power_save();
     return ESP_OK;
 }

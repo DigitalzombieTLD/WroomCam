@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "http_stream.h"
 #include "uvc_source.h"
+#include "wifi_manager.h"
 
 static const char *TAG = "http";
 
@@ -28,7 +29,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
 {
     // esp_http_server runs handlers on one task, so this serves a single viewer at a time;
     // further connections queue until the current stream ends.
-    ESP_LOGI(TAG, "Stream client connected");
+    ESP_LOGI(TAG, "Stream client connected; starting camera on demand");
     httpd_resp_set_type(req, CONTENT_TYPE);
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -36,6 +37,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
     esp_err_t err = ESP_OK;
     unsigned sent = 0;
     int idle_ms = 0;
+    wifi_manager_set_streaming(true);
     uvc_source_set_consumer(true);
 
     while (err == ESP_OK) {
@@ -65,6 +67,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
     }
 
     uvc_source_set_consumer(false);
+    wifi_manager_set_streaming(false);
     ESP_LOGI(TAG, "Stream client gone (%u frames sent, %s)", sent, esp_err_to_name(err));
     return err == ESP_OK ? httpd_resp_send_chunk(req, NULL, 0) : ESP_FAIL;
 }

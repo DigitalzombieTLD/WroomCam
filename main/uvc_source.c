@@ -19,16 +19,19 @@ static const char *TAG = "uvc";
 #define HEALTHY_RUN_MS 10000
 #define MAX_TRANSFER_ERRORS 10
 #define RELEASE_WAIT_MS ((CONFIG_WROOMCAM_HTTP_SEND_TIMEOUT_S + 2) * 1000)
+#define IDLE_RECHECK_MS 1000
 
 enum {
     EV_DISCONNECTED = BIT0,
     EV_BROKEN = BIT1,
+    EV_STATE_CHANGED = BIT2,
 };
 
 static EventGroupHandle_t s_events;
 static QueueHandle_t s_queue;  // holds at most the single newest frame
 static uvc_host_stream_hdl_t s_stream;
 static atomic_bool s_consumer;
+static atomic_bool s_network_ready;
 static atomic_bool s_accepting;
 static atomic_bool s_device_seen;
 static atomic_int s_outstanding;  // frames kept from the driver (queued or held by the HTTP handler)
@@ -44,11 +47,27 @@ static uint32_t s_frame_caps;
 
 static void drain_queue(void);
 
+static bool stream_is_allowed(void)
+{
+    return atomic_load(&s_consumer) && atomic_load(&s_network_ready);
+}
+
 void uvc_source_set_consumer(bool active)
 {
     atomic_store(&s_consumer, active);
-    if (!active) {
+    if (!active && s_queue) {
         drain_queue();
+    }
+    if (s_events) {
+        xEventGroupSetBits(s_events, EV_STATE_CHANGED);
+    }
+}
+
+void uvc_source_set_network_ready(bool ready)
+{
+    atomic_store(&s_network_ready, ready);
+    if (s_events) {
+        xEventGroupSetBits(s_events, EV_STATE_CHANGED);
     }
 }
 
@@ -91,7 +110,8 @@ static bool frame_cb(const uvc_host_frame_t *frame, void *user_ctx)
     atomic_fetch_add(&s_frames, 1);
     atomic_store(&s_transfer_errors, 0);
 
-    if (!atomic_load(&s_consumer) || !atomic_load(&s_accepting) || frame->data_len == 0) {
+    if (!atomic_load(&s_consumer) || !atomic_load(&s_network_ready) ||
+        !atomic_load(&s_accepting) || frame->data_len == 0) {
         return true;  // driver reuses the buffer immediately
     }
 
@@ -226,6 +246,11 @@ static void restart_chip(const char *why)
     esp_restart();
 }
 
+static void wait_for_state_change(TickType_t timeout)
+{
+    xEventGroupWaitBits(s_events, EV_STATE_CHANGED, pdTRUE, pdFALSE, timeout);
+}
+
 static void supervisor_task(void *arg)
 {
     const uvc_host_stream_config_t cfg = {
@@ -247,6 +272,10 @@ static void supervisor_task(void *arg)
     unsigned wait_logs = 0;
 
     while (true) {
+        // Do not open/start UVC until an HTTP viewer has requested the stream and Wi-Fi has an IP.
+        while (!stream_is_allowed()) {
+            wait_for_state_change(portMAX_DELAY);
+        }
         xEventGroupClearBits(s_events, EV_DISCONNECTED | EV_BROKEN);
         atomic_store(&s_transfer_errors, 0);
 
@@ -265,11 +294,14 @@ static void supervisor_task(void *arg)
         }
 
         if (err != ESP_OK) {
+            if (!stream_is_allowed()) {
+                continue;
+            }
             if (stream == NULL && !atomic_load(&s_device_seen)) {
-                // Nothing plugged in yet: keep waiting quietly, this is not a failure.
                 if (wait_logs++ % 5 == 0) {
                     ESP_LOGI(TAG, "Waiting for UVC camera on the USB-OTG port...");
                 }
+                wait_for_state_change(pdMS_TO_TICKS(IDLE_RECHECK_MS));
                 continue;
             }
             failures++;
@@ -278,7 +310,7 @@ static void supervisor_task(void *arg)
             if (failures >= CONFIG_WROOMCAM_MAX_FAILURES) {
                 restart_chip("too many stream failures");
             }
-            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            wait_for_state_change(pdMS_TO_TICKS(backoff_ms));
             backoff_ms = backoff_ms * 2 > CONFIG_WROOMCAM_BACKOFF_MAX_MS ? CONFIG_WROOMCAM_BACKOFF_MAX_MS : backoff_ms * 2;
             continue;
         }
@@ -288,24 +320,30 @@ static void supervisor_task(void *arg)
         atomic_store(&s_last_frame_us, (unsigned long long)started_us);
         unsigned frames_at_start = atomic_load(&s_frames);
         atomic_store(&s_accepting, true);
-        ESP_LOGI(TAG, "Streaming started");
+        ESP_LOGI(TAG, "UVC capture started for active MJPEG client");
 
         const char *reason = NULL;
         bool disconnected = false;
+        bool idle_shutdown = false;
         while (!reason) {
-            EventBits_t bits = xEventGroupWaitBits(s_events, EV_DISCONNECTED | EV_BROKEN, pdFALSE, pdFALSE,
+            EventBits_t bits = xEventGroupWaitBits(s_events,
+                                                   EV_DISCONNECTED | EV_BROKEN | EV_STATE_CHANGED,
+                                                   pdTRUE, pdFALSE,
                                                    pdMS_TO_TICKS(MONITOR_PERIOD_MS));
             if (bits & EV_DISCONNECTED) {
                 reason = "camera disconnected";
                 disconnected = true;
             } else if (bits & EV_BROKEN) {
                 reason = "repeated USB transfer errors";
+            } else if ((bits & EV_STATE_CHANGED) && !stream_is_allowed()) {
+                reason = atomic_load(&s_consumer) ? "Wi-Fi unavailable" : "no MJPEG clients";
+                idle_shutdown = true;
             } else if ((esp_timer_get_time() - (int64_t)atomic_load(&s_last_frame_us)) / 1000 >
                        CONFIG_WROOMCAM_STALL_TIMEOUT_MS) {
                 reason = "stream stalled (no frames)";
             }
         }
-        ESP_LOGW(TAG, "Stopping stream: %s (%u frames, %u dropped total)", reason,
+        ESP_LOGW(TAG, "Stopping UVC capture: %s (%u frames, %u dropped total)", reason,
                  atomic_load(&s_frames) - frames_at_start, atomic_load(&s_dropped));
 
         bool delivered = atomic_load(&s_frames) != frames_at_start;
@@ -314,7 +352,7 @@ static void supervisor_task(void *arg)
             restart_chip("stream close failed");
         }
 
-        if (disconnected || healthy) {
+        if (idle_shutdown || disconnected || healthy) {
             failures = 0;
             backoff_ms = CONFIG_WROOMCAM_BACKOFF_MIN_MS;
         } else {
@@ -323,7 +361,7 @@ static void supervisor_task(void *arg)
                 restart_chip("too many stream failures");
             }
             ESP_LOGW(TAG, "Failure %u/%d, retry in %u ms", failures, CONFIG_WROOMCAM_MAX_FAILURES, (unsigned)backoff_ms);
-            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            wait_for_state_change(pdMS_TO_TICKS(backoff_ms));
             backoff_ms = backoff_ms * 2 > CONFIG_WROOMCAM_BACKOFF_MAX_MS ? CONFIG_WROOMCAM_BACKOFF_MAX_MS : backoff_ms * 2;
         }
     }

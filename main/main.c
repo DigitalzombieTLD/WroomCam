@@ -15,9 +15,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    // Wi-Fi, USB and HTTP come up independently so boot time is not serialised.
-    ESP_ERROR_CHECK(wifi_manager_start());
+    // Install USB first so Wi-Fi events can safely notify the camera supervisor.
     ESP_ERROR_CHECK(uvc_source_start());
+    ESP_ERROR_CHECK(wifi_manager_start());
     ESP_ERROR_CHECK(http_stream_start());
 
     ESP_LOGI(TAG, "Started; stream will be at http://<device-ip>:%d/stream", CONFIG_WROOMCAM_HTTP_PORT);
