@@ -53,3 +53,15 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# ESP-IDF build / generated files
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+.vscode/
+.idea/
+__pycache__/
+
+# Local credentials (never commit) - copy sdkconfig.secrets.example to this name
+sdkconfig.secrets

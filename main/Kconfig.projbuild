@@ -1,0 +1,119 @@
+menu "WroomCam"
+
+    menu "Wi-Fi"
+        config WROOMCAM_WIFI_SSID
+            string "Wi-Fi SSID"
+            default "YOUR_WIFI_SSID"
+            help
+                Placeholder by default. Set it in the git-ignored sdkconfig.secrets file.
+
+        config WROOMCAM_WIFI_PASSWORD
+            string "Wi-Fi password (empty = open network)"
+            default "YOUR_WIFI_PASSWORD"
+            help
+                Placeholder by default. Set it in the git-ignored sdkconfig.secrets file.
+
+        config WROOMCAM_WIFI_MAX_RECONNECT
+            int "Consecutive failed Wi-Fi attempts before rebooting (0 = never)"
+            default 30
+            range 0 1000
+
+        config WROOMCAM_STATIC_IP
+            bool "Use static IPv4 instead of DHCP"
+            default n
+
+        config WROOMCAM_IP_ADDR
+            string "Static IPv4 address"
+            default "192.168.1.50"
+            depends on WROOMCAM_STATIC_IP
+
+        config WROOMCAM_IP_GATEWAY
+            string "Gateway"
+            default "192.168.1.1"
+            depends on WROOMCAM_STATIC_IP
+
+        config WROOMCAM_IP_NETMASK
+            string "Netmask"
+            default "255.255.255.0"
+            depends on WROOMCAM_STATIC_IP
+
+        config WROOMCAM_IP_DNS
+            string "DNS server"
+            default "192.168.1.1"
+            depends on WROOMCAM_STATIC_IP
+    endmenu
+
+    menu "Camera"
+        config WROOMCAM_CAM_WIDTH
+            int "MJPEG frame width"
+            default 320
+            range 160 2048
+
+        config WROOMCAM_CAM_HEIGHT
+            int "MJPEG frame height"
+            default 240
+            range 120 1536
+
+        config WROOMCAM_CAM_FPS
+            int "Frames per second"
+            default 15
+            range 1 60
+
+        config WROOMCAM_CAM_FRAME_BUF_KB
+            int "Frame buffer size in KiB (0 = auto: max(32, width*height/4 bytes))"
+            default 0
+            range 0 2048
+            help
+                Frames larger than this are dropped (overflow). Raise it if you see
+                "frame buffer overflow" logs at high resolutions.
+
+        config WROOMCAM_CAM_NUM_FRAME_BUFFERS
+            int "Number of frame buffers"
+            default 3
+            range 3 6
+            help
+                Minimum 3: one being filled by USB, one queued, one being sent.
+
+        config WROOMCAM_NO_PSRAM_LOW_RES
+            bool "Without PSRAM, force 320x240 if a larger mode is configured"
+            default y
+
+        config WROOMCAM_STALL_TIMEOUT_MS
+            int "No-frame timeout before the stream is restarted (ms)"
+            default 5000
+            range 1000 60000
+
+        config WROOMCAM_MAX_FAILURES
+            int "Consecutive stream failures before rebooting the chip"
+            default 8
+            range 1 100
+
+        config WROOMCAM_BACKOFF_MIN_MS
+            int "Initial retry backoff (ms)"
+            default 1000
+            range 100 60000
+
+        config WROOMCAM_BACKOFF_MAX_MS
+            int "Maximum retry backoff (ms)"
+            default 15000
+            range 1000 120000
+    endmenu
+
+    menu "HTTP"
+        config WROOMCAM_HTTP_PORT
+            int "HTTP port"
+            default 80
+            range 1 65535
+
+        config WROOMCAM_HTTP_SEND_TIMEOUT_S
+            int "Socket send timeout (slow client is dropped after this)"
+            default 5
+            range 1 60
+
+        config WROOMCAM_HTTP_FRAME_WAIT_S
+            int "End the stream response if no frame arrives for this long (s)"
+            default 15
+            range 2 120
+    endmenu
+
+endmenu
