@@ -44,6 +44,14 @@ menu "WroomCam"
     endmenu
 
     menu "Camera"
+        config WROOMCAM_AUTO_DETECT_MODE
+            bool "Probe camera MJPEG modes on demand"
+            default n
+            help
+                Temporarily discover and test advertised MJPEG modes whenever a
+                client requests a stream. Candidates are tried from smallest
+                resolution and slowest advertised frame rate upward.
+
         config WROOMCAM_CAM_WIDTH
             int "MJPEG frame width"
             default 320

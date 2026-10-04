@@ -1,4 +1,6 @@
 #include <stdatomic.h>
+#include <stdint.h>
+#include <string.h>
 #include "esp_heap_caps.h"
 #include "esp_intr_alloc.h"
 #include "esp_log.h"
@@ -21,6 +23,10 @@ static const char *TAG = "uvc";
 #define MAX_TRANSFER_ERRORS 10
 #define RELEASE_WAIT_MS ((CONFIG_WROOMCAM_HTTP_SEND_TIMEOUT_S + 2) * 1000)
 #define IDLE_RECHECK_MS 1000
+#ifdef CONFIG_WROOMCAM_AUTO_DETECT_MODE
+#define MAX_DISCOVERED_FRAME_INFO 64
+#define MAX_MODE_CANDIDATES 64
+#endif
 
 enum {
     EV_DISCONNECTED = BIT0,
@@ -40,6 +46,20 @@ static atomic_uint s_transfer_errors;
 static atomic_ullong s_last_frame_us;
 static atomic_uint s_frames;
 static atomic_uint s_dropped;
+
+#ifdef CONFIG_WROOMCAM_AUTO_DETECT_MODE
+typedef struct {
+    unsigned width;
+    unsigned height;
+    float fps;
+    uint64_t pixel_area;
+} mode_candidate_t;
+
+static atomic_uint s_dev_addr;
+static atomic_uint s_stream_index;
+static uvc_host_frame_info_t s_frame_info[MAX_DISCOVERED_FRAME_INFO];
+static mode_candidate_t s_candidates[MAX_MODE_CANDIDATES];
+#endif
 
 static unsigned s_width, s_height;
 static float s_fps;
@@ -163,7 +183,12 @@ static void driver_event_cb(const uvc_host_driver_event_data_t *event, void *use
         ESP_LOGI(TAG, "UVC device connected: addr %u, stream index %u, %u advertised frame modes",
                  event->device_connected.dev_addr, event->device_connected.uvc_stream_index,
                  (unsigned)event->device_connected.frame_info_num);
+#ifdef CONFIG_WROOMCAM_AUTO_DETECT_MODE
+        atomic_store(&s_dev_addr, event->device_connected.dev_addr);
+        atomic_store(&s_stream_index, event->device_connected.uvc_stream_index);
+#endif
         atomic_store(&s_device_seen, true);
+        xEventGroupSetBits(s_events, EV_STATE_CHANGED);
     }
 }
 
@@ -240,6 +265,281 @@ static bool teardown_stream(uvc_host_stream_hdl_t stream, bool disconnected)
     return true;
 }
 
+static void restart_chip(const char *why);
+
+static uvc_host_stream_config_t stream_config_for_mode(unsigned width, unsigned height, float fps)
+{
+    size_t frame_size = CONFIG_WROOMCAM_CAM_FRAME_BUF_KB
+                            ? (size_t)CONFIG_WROOMCAM_CAM_FRAME_BUF_KB * 1024
+                            : (size_t)width * height / 4;
+    if (!CONFIG_WROOMCAM_CAM_FRAME_BUF_KB && frame_size < 32 * 1024) {
+        frame_size = 32 * 1024;
+    }
+    return (uvc_host_stream_config_t) {
+        .event_cb = stream_event_cb,
+        .frame_cb = frame_cb,
+        .user_ctx = NULL,
+        .usb = {.dev_addr = UVC_HOST_ANY_DEV_ADDR, .vid = UVC_HOST_ANY_VID, .pid = UVC_HOST_ANY_PID,
+                .uvc_stream_index = 0},
+        .vs_format = {.h_res = width, .v_res = height, .fps = fps, .format = UVC_VS_FORMAT_MJPEG},
+        .advanced = {.number_of_frame_buffers = CONFIG_WROOMCAM_CAM_NUM_FRAME_BUFFERS,
+                     .frame_size = frame_size,
+                     .frame_heap_caps = s_frame_caps,
+                     .number_of_urbs = 3,
+                     .urb_size = 0},
+    };
+}
+
+static esp_err_t open_and_start_stream(const uvc_host_stream_config_t *cfg, uvc_host_stream_hdl_t *stream)
+{
+    *stream = NULL;
+    esp_err_t err = uvc_host_stream_open(cfg, pdMS_TO_TICKS(OPEN_TIMEOUT_MS), stream);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    s_stream = *stream;
+    atomic_store(&s_device_seen, true);
+    err = uvc_host_stream_start(*stream);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "stream_start failed: %s (camera may not support this mode)", esp_err_to_name(err));
+        bool disconnected = (xEventGroupGetBits(s_events) & EV_DISCONNECTED) != 0;
+        if (!teardown_stream(*stream, disconnected)) {
+            restart_chip("close after failed start");
+        }
+        *stream = NULL;
+    } else if (!stream_is_allowed()) {
+        if (!teardown_stream(*stream, false)) {
+            restart_chip("close after client stopped during open");
+        }
+        *stream = NULL;
+        return ESP_ERR_INVALID_STATE;
+    }
+    return err;
+}
+
+#ifdef CONFIG_WROOMCAM_AUTO_DETECT_MODE
+static const char *frame_format_name(enum uvc_host_stream_format format)
+{
+    switch (format) {
+    case UVC_VS_FORMAT_MJPEG: return "MJPEG";
+    case UVC_VS_FORMAT_YUY2: return "YUY2";
+    case UVC_VS_FORMAT_H264: return "H264";
+    case UVC_VS_FORMAT_H265: return "H265";
+    case UVC_VS_FORMAT_NV12: return "NV12";
+    default: return "unknown";
+    }
+}
+
+static bool candidate_precedes(const mode_candidate_t *left, const mode_candidate_t *right)
+{
+    if (left->pixel_area != right->pixel_area) {
+        return left->pixel_area < right->pixel_area;
+    }
+    return left->fps < right->fps;
+}
+
+static void add_mode_candidate(const uvc_host_frame_info_t *frame, uint32_t interval)
+{
+    if (interval == 0) {
+        return;
+    }
+
+    mode_candidate_t candidate = {
+        .width = frame->h_res,
+        .height = frame->v_res,
+        .fps = 10000000.0f / interval,
+        .pixel_area = (uint64_t)frame->h_res * frame->v_res,
+    };
+    size_t insert_at = 0;
+    while (insert_at < MAX_MODE_CANDIDATES) {
+        if (s_candidates[insert_at].pixel_area == 0) {
+            break;
+        }
+        if (s_candidates[insert_at].width == candidate.width &&
+            s_candidates[insert_at].height == candidate.height &&
+            s_candidates[insert_at].fps == candidate.fps) {
+            return;
+        }
+        if (candidate_precedes(&candidate, &s_candidates[insert_at])) {
+            break;
+        }
+        insert_at++;
+    }
+    if (insert_at >= MAX_MODE_CANDIDATES) {
+        return;
+    }
+
+    size_t end = insert_at;
+    while (end + 1 < MAX_MODE_CANDIDATES && s_candidates[end].pixel_area != 0) {
+        end++;
+    }
+    if (end == MAX_MODE_CANDIDATES - 1 && s_candidates[end].pixel_area != 0) {
+        end--;
+    }
+    while (end > insert_at) {
+        s_candidates[end] = s_candidates[end - 1];
+        end--;
+    }
+    s_candidates[insert_at] = candidate;
+}
+
+static void inspect_frame_info(const uvc_host_frame_info_t *frame)
+{
+    float default_fps = frame->default_interval ? 10000000.0f / frame->default_interval : 0.0f;
+    if (frame->interval_type == 0) {
+        ESP_LOGI(TAG, "Advertised %s %ux%u default %.2f fps; continuous intervals %u..%u step %u",
+                 frame_format_name(frame->format), frame->h_res, frame->v_res, default_fps,
+                 frame->interval_min, frame->interval_max, frame->interval_step);
+    } else {
+        unsigned intervals = frame->interval_type;
+        if (intervals > CONFIG_UVC_INTERVAL_ARRAY_SIZE) {
+            intervals = CONFIG_UVC_INTERVAL_ARRAY_SIZE;
+        }
+        ESP_LOGI(TAG, "Advertised %s %ux%u default %.2f fps; %u discrete intervals available (%u retained)",
+                 frame_format_name(frame->format), frame->h_res, frame->v_res, default_fps,
+                 (unsigned)frame->interval_type, intervals);
+        for (unsigned i = 0; i < intervals; i++) {
+            ESP_LOGI(TAG, "  interval %u: %u (%.2f fps)", i,
+                     frame->interval[i], frame->interval[i] ? 10000000.0f / frame->interval[i] : 0.0f);
+        }
+    }
+}
+
+static void add_frame_candidates(const uvc_host_frame_info_t *frame)
+{
+    if (frame->format != UVC_VS_FORMAT_MJPEG || frame->h_res == 0 || frame->v_res == 0) {
+        return;
+    }
+
+    if (frame->interval_type == 0) {
+        uint32_t interval = frame->interval_max;
+        if (frame->interval_min == 0 || frame->interval_max < frame->interval_min) {
+            return;
+        }
+        if (frame->interval_step == 0) {
+            interval = frame->interval_min;
+        } else {
+            interval = frame->interval_min +
+                       ((frame->interval_max - frame->interval_min) / frame->interval_step) *
+                           frame->interval_step;
+        }
+
+        for (unsigned i = 0; i < MAX_MODE_CANDIDATES; i++) {
+            add_mode_candidate(frame, interval);
+            if (frame->interval_step == 0 || interval - frame->interval_min < frame->interval_step) {
+                break;
+            }
+            interval -= frame->interval_step;
+        }
+
+        if (frame->default_interval >= frame->interval_min &&
+            frame->default_interval <= frame->interval_max &&
+            (frame->interval_step == 0
+                 ? frame->default_interval == frame->interval_min
+                 : (frame->default_interval - frame->interval_min) % frame->interval_step == 0)) {
+            add_mode_candidate(frame, frame->default_interval);
+        }
+        return;
+    }
+
+    unsigned intervals = frame->interval_type;
+    if (intervals > CONFIG_UVC_INTERVAL_ARRAY_SIZE) {
+        intervals = CONFIG_UVC_INTERVAL_ARRAY_SIZE;
+    }
+    bool default_added = false;
+    for (unsigned i = 0; i < intervals; i++) {
+        add_mode_candidate(frame, frame->interval[i]);
+        default_added |= frame->interval[i] == frame->default_interval;
+    }
+    if (!default_added) {
+        add_mode_candidate(frame, frame->default_interval);
+    }
+}
+
+static esp_err_t discover_and_start_mode(uvc_host_stream_hdl_t *stream)
+{
+    uint8_t dev_addr = (uint8_t)atomic_load(&s_dev_addr);
+    uint8_t stream_index = (uint8_t)atomic_load(&s_stream_index);
+    size_t frame_count = 0;
+    esp_err_t err = uvc_host_get_frame_list(dev_addr, stream_index, NULL, &frame_count);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not query camera frame list: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (frame_count == 0) {
+        ESP_LOGE(TAG, "Camera returned an empty frame list");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t capacity = frame_count < MAX_DISCOVERED_FRAME_INFO ? frame_count : MAX_DISCOVERED_FRAME_INFO;
+    if (frame_count > capacity) {
+        ESP_LOGW(TAG, "Camera advertises %u frame entries; inspecting the first %u",
+                 (unsigned)frame_count, (unsigned)capacity);
+    }
+    size_t retrieved = capacity;
+    err = uvc_host_get_frame_list(dev_addr, stream_index,
+                                  (uvc_host_frame_info_t (*)[])s_frame_info, &retrieved);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not retrieve camera frame list: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (retrieved > capacity) {
+        retrieved = capacity;
+    }
+
+    memset(s_candidates, 0, sizeof(s_candidates));
+    for (size_t i = 0; i < retrieved; i++) {
+        inspect_frame_info(&s_frame_info[i]);
+        add_frame_candidates(&s_frame_info[i]);
+    }
+
+    size_t candidate_count = 0;
+    while (candidate_count < MAX_MODE_CANDIDATES &&
+           s_candidates[candidate_count].pixel_area != 0) {
+        candidate_count++;
+    }
+    if (candidate_count == 0) {
+        ESP_LOGE(TAG, "No usable MJPEG modes found in %u advertised frame entries", (unsigned)retrieved);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    esp_err_t last_err = ESP_ERR_NOT_FOUND;
+    unsigned tried = 0;
+    for (size_t i = 0; i < candidate_count; i++) {
+        if (!stream_is_allowed() || !atomic_load(&s_device_seen)) {
+            break;
+        }
+        const mode_candidate_t *candidate = &s_candidates[i];
+        uvc_host_stream_config_t cfg =
+            stream_config_for_mode(candidate->width, candidate->height, candidate->fps);
+        cfg.usb.dev_addr = dev_addr;
+        cfg.usb.uvc_stream_index = stream_index;
+        ESP_LOGI(TAG, "Probing MJPEG %ux%u @ %.2f fps (%u/%u)",
+                 candidate->width, candidate->height, candidate->fps,
+                 (unsigned)(i + 1), (unsigned)candidate_count);
+        last_err = open_and_start_stream(&cfg, stream);
+        tried++;
+        if (last_err == ESP_OK) {
+            s_width = candidate->width;
+            s_height = candidate->height;
+            s_fps = candidate->fps;
+            s_frame_size = cfg.advanced.frame_size;
+            ESP_LOGI(TAG, "Auto-detect selected MJPEG %ux%u @ %.2f fps after successful open/start",
+                     s_width, s_height, s_fps);
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "Mode %ux%u @ %.2f fps failed: %s",
+                 candidate->width, candidate->height, candidate->fps, esp_err_to_name(last_err));
+    }
+
+    ESP_LOGE(TAG, "Auto-detect exhausted after %u/%u MJPEG candidates; last error: %s%s",
+             tried, (unsigned)candidate_count, esp_err_to_name(last_err),
+             atomic_load(&s_device_seen) ? "" : " (camera disconnected)");
+    return last_err;
+}
+#endif
+
 static void restart_chip(const char *why)
 {
     ESP_LOGE(TAG, "Unrecoverable (%s): restarting", why);
@@ -254,19 +554,9 @@ static void wait_for_state_change(TickType_t timeout)
 
 static void supervisor_task(void *arg)
 {
-    const uvc_host_stream_config_t cfg = {
-        .event_cb = stream_event_cb,
-        .frame_cb = frame_cb,
-        .user_ctx = NULL,
-        .usb = {.dev_addr = UVC_HOST_ANY_DEV_ADDR, .vid = UVC_HOST_ANY_VID, .pid = UVC_HOST_ANY_PID,
-                .uvc_stream_index = 0},
-        .vs_format = {.h_res = s_width, .v_res = s_height, .fps = s_fps, .format = UVC_VS_FORMAT_MJPEG},
-        .advanced = {.number_of_frame_buffers = CONFIG_WROOMCAM_CAM_NUM_FRAME_BUFFERS,
-                     .frame_size = s_frame_size,
-                     .frame_heap_caps = s_frame_caps,
-                     .number_of_urbs = 3,
-                     .urb_size = 0},
-    };
+#ifndef CONFIG_WROOMCAM_AUTO_DETECT_MODE
+    const uvc_host_stream_config_t fixed_cfg = stream_config_for_mode(s_width, s_height, s_fps);
+#endif
 
     unsigned failures = 0;
     uint32_t backoff_ms = CONFIG_WROOMCAM_BACKOFF_MIN_MS;
@@ -281,18 +571,11 @@ static void supervisor_task(void *arg)
         atomic_store(&s_transfer_errors, 0);
 
         uvc_host_stream_hdl_t stream = NULL;
-        esp_err_t err = uvc_host_stream_open(&cfg, pdMS_TO_TICKS(OPEN_TIMEOUT_MS), &stream);
-        if (err == ESP_OK) {
-            s_stream = stream;
-            atomic_store(&s_device_seen, true);
-            err = uvc_host_stream_start(stream);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "stream_start failed: %s (camera may not support this mode)", esp_err_to_name(err));
-                if (!teardown_stream(stream, false)) {
-                    restart_chip("close after failed start");
-                }
-            }
-        }
+#ifdef CONFIG_WROOMCAM_AUTO_DETECT_MODE
+        esp_err_t err = discover_and_start_mode(&stream);
+#else
+        esp_err_t err = open_and_start_stream(&fixed_cfg, &stream);
+#endif
 
         if (err != ESP_OK) {
             if (!stream_is_allowed()) {
