@@ -60,10 +60,27 @@ Configure in `sdkconfig.secrets` (copy `sdkconfig.secrets.example`) or `idf.py m
 | Wi-Fi SSID/password | placeholders; replace before use |
 | Static IPv4 address/gateway/netmask/DNS | DHCP by default; static optional |
 | Camera width/height/FPS | 320x240 @ 15 fps MJPEG |
+| Probe camera MJPEG modes on demand | Off |
 | Frame buffer size | auto; increase if the log reports frame overflow |
 | HTTP port | 80 |
 
 Raise camera resolution/FPS in steps and check camera mode support and logs. USB Full-Speed means a mode advertised by the camera is not necessarily usable on the ESP32-S3. PSRAM is strongly recommended for larger JPEG frames.
+
+### Temporarily discover camera modes
+
+To test descriptor-reported modes instead of the configured fixed width, height, and FPS, enable **WroomCam → Camera → Probe camera MJPEG modes on demand** in `idf.py menuconfig`, or add this line to your local, git-ignored `sdkconfig.secrets`:
+
+```ini
+CONFIG_WROOMCAM_AUTO_DETECT_MODE=y
+```
+
+The default is off. Discovery and probing happen only after both Wi-Fi is ready and a `/stream` client is connected. The firmware logs each reported format, resolution, default frame rate, and advertised interval data. It tries at most 64 candidates, ordered by increasing pixel area and then increasing FPS (the lowest-bandwidth advertised rate first within each resolution). Each candidate must both open and start; failed opens/starts are closed before trying the next. The first successful mode is logged as:
+
+```text
+Auto-detect selected MJPEG <width>x<height> @ <fps> fps after successful open/start
+```
+
+If probing exhausts the list, the existing stream retry/backoff policy applies once to the whole candidate list; the firmware does not reboot after each candidate. After noting the selected mode, turn the option off in menuconfig (or set `CONFIG_WROOMCAM_AUTO_DETECT_MODE=n`) and set `CONFIG_WROOMCAM_CAM_WIDTH`, `CONFIG_WROOMCAM_CAM_HEIGHT`, and `CONFIG_WROOMCAM_CAM_FPS` to the logged values. Rebuild and flash to return to the normal fixed-mode configuration.
 
 ## Use
 
