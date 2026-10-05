@@ -181,7 +181,8 @@ static void driver_event_cb(const uvc_host_driver_event_data_t *event, void *use
 {
     if (event->type == UVC_HOST_DRIVER_EVENT_DEVICE_CONNECTED) {
         ESP_LOGI(TAG, "UVC device connected: addr %u, stream index %u, %u advertised frame modes",
-                 event->device_connected.dev_addr, event->device_connected.uvc_stream_index,
+                 (unsigned)event->device_connected.dev_addr,
+                 (unsigned)event->device_connected.uvc_stream_index,
                  (unsigned)event->device_connected.frame_info_num);
 #ifdef CONFIG_WROOMCAM_AUTO_DETECT_MODE
         atomic_store(&s_dev_addr, event->device_connected.dev_addr);
@@ -389,19 +390,20 @@ static void inspect_frame_info(const uvc_host_frame_info_t *frame)
     float default_fps = frame->default_interval ? 10000000.0f / frame->default_interval : 0.0f;
     if (frame->interval_type == 0) {
         ESP_LOGI(TAG, "Advertised %s %ux%u default %.2f fps; continuous intervals %u..%u step %u",
-                 frame_format_name(frame->format), frame->h_res, frame->v_res, default_fps,
-                 frame->interval_min, frame->interval_max, frame->interval_step);
+                 frame_format_name(frame->format), (unsigned)frame->h_res, (unsigned)frame->v_res, default_fps,
+                 (unsigned)frame->interval_min, (unsigned)frame->interval_max,
+                 (unsigned)frame->interval_step);
     } else {
         unsigned intervals = frame->interval_type;
         if (intervals > CONFIG_UVC_INTERVAL_ARRAY_SIZE) {
             intervals = CONFIG_UVC_INTERVAL_ARRAY_SIZE;
         }
         ESP_LOGI(TAG, "Advertised %s %ux%u default %.2f fps; %u discrete intervals available (%u retained)",
-                 frame_format_name(frame->format), frame->h_res, frame->v_res, default_fps,
+                 frame_format_name(frame->format), (unsigned)frame->h_res, (unsigned)frame->v_res, default_fps,
                  (unsigned)frame->interval_type, intervals);
         for (unsigned i = 0; i < intervals; i++) {
             ESP_LOGI(TAG, "  interval %u: %u (%.2f fps)", i,
-                     frame->interval[i], frame->interval[i] ? 10000000.0f / frame->interval[i] : 0.0f);
+                     (unsigned)frame->interval[i], frame->interval[i] ? 10000000.0f / frame->interval[i] : 0.0f);
         }
     }
 }
@@ -590,7 +592,7 @@ static void supervisor_task(void *arg)
             }
             failures++;
             ESP_LOGE(TAG, "Stream open/start failed (%s), failure %u/%d, retry in %u ms",
-                     esp_err_to_name(err), failures, CONFIG_WROOMCAM_MAX_FAILURES, (unsigned)backoff_ms);
+                     esp_err_to_name(err), (unsigned)failures, CONFIG_WROOMCAM_MAX_FAILURES, (unsigned)backoff_ms);
             if (failures >= CONFIG_WROOMCAM_MAX_FAILURES) {
                 restart_chip("too many stream failures");
             }
@@ -628,7 +630,8 @@ static void supervisor_task(void *arg)
             }
         }
         ESP_LOGW(TAG, "Stopping UVC capture: %s (%u frames, %u dropped total)", reason,
-                 atomic_load(&s_frames) - frames_at_start, atomic_load(&s_dropped));
+                 (unsigned)(atomic_load(&s_frames) - frames_at_start),
+                 (unsigned)atomic_load(&s_dropped));
 
         bool delivered = atomic_load(&s_frames) != frames_at_start;
         bool healthy = delivered && (esp_timer_get_time() - started_us) / 1000 >= HEALTHY_RUN_MS;
