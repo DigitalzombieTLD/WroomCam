@@ -1,7 +1,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "wifi_manager.h"
-#include "uvc_source.h"
+#include "camera_source.h"
 #include "http_stream.h"
 
 static const char *TAG = "wroomcam";
@@ -15,8 +15,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    // Install USB first so Wi-Fi events can safely notify the camera supervisor.
-    ESP_ERROR_CHECK(uvc_source_start());
+    ESP_ERROR_CHECK(camera_source_start());
     ESP_ERROR_CHECK(wifi_manager_start());
     ESP_ERROR_CHECK(http_stream_start());
 

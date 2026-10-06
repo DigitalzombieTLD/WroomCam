@@ -1,13 +1,12 @@
-# WroomCam defaults for ESP32-S3 USB-host MJPEG streaming.
-CONFIG_IDF_TARGET="esp32s3"
+# WroomCam defaults for ESP32-CAM (AI-Thinker, OV2640) MJPEG streaming.
+CONFIG_IDF_TARGET="esp32"
 
-# --- Module shown in the supplied photo: ESP32-S3-WROOM-1-N16R8 ---
-# N16R8 uses 16 MB Quad-SPI flash and 8 MB Octal-SPI PSRAM.
-CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# --- ESP32-CAM (AI-Thinker): ESP32-S, 4 MB flash ---
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
-# --- Console/debug output through the board's USB-to-serial bridge (UART0) ---
+# --- Console/debug output through the ESP32-CAM-MB USB-to-serial adapter (UART0) ---
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
@@ -20,23 +19,17 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_BOOTLOADER_SKIP_VALIDATE_ON_POWER_ON=y
 CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
 
-# --- PSRAM: N16R8 is Octal PSRAM. For variants without PSRAM, firmware has a low-res fallback. ---
+# --- PSRAM: 4 MB Quad-SPI PSRAM (8 MB chip, 4 MB usable) holds camera frame buffers ---
 CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_40M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
 
-# --- USB host ---
-CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=3000
-CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
-
-# --- Disable unnecessary features; retain station Wi-Fi and USB host ---
+# --- Disable unnecessary features; retain station Wi-Fi ---
 # CONFIG_BT_ENABLED is not set
 # CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set
 # CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT is not set
-# CONFIG_UVC_PRINTF_CONFIGURATION_DESCRIPTOR is not set
 CONFIG_ESP_WIFI_NVS_ENABLED=n
 
 # --- Recovery: reboot on panic / task watchdog instead of halting ---

@@ -1,4 +1,4 @@
 dependencies:
   idf: ">=5.4.0,<5.6.0"
-  # Espressif maintained UVC host driver (esp-usb). Pinned to the 2.5.x series.
-  espressif/usb_host_uvc: "~2.5.2"
+  # Official Espressif DVP camera driver (OV2640 on the AI-Thinker ESP32-CAM).
+  espressif/esp32-camera: "~2.0.15"

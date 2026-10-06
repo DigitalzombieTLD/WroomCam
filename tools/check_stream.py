@@ -9,9 +9,7 @@ import time
 import urllib.request
 
 
-def main():
-    url = sys.argv[1]
-    want = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+def check_stream(url, want):
     resp = urllib.request.urlopen(url, timeout=10)
     ctype = resp.headers.get("Content-Type", "")
     m = re.match(r"multipart/x-mixed-replace;\s*boundary=(\S+)", ctype)
@@ -39,7 +37,13 @@ def main():
         assert b"\xff\xd9" in data[-16:], f"frame {n}: missing JPEG EOI"
         total += length
     dt = time.time() - start
-    print(f"OK: {want} frames, {want / dt:.1f} fps, {total / dt / 1024:.0f} KiB/s, avg {total // want} bytes/frame")
+    return f"OK: {want} frames, {want / max(dt, 1e-6):.1f} fps, {total / max(dt, 1e-6) / 1024:.0f} KiB/s, avg {total // want} bytes/frame"
+
+
+def main():
+    url = sys.argv[1]
+    want = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    print(check_stream(url, want))
 
 
 if __name__ == "__main__":
