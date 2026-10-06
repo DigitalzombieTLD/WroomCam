@@ -5,7 +5,6 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
-#include "uvc_source.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "wifi";
@@ -52,7 +51,6 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *ev = data;
         s_has_ip = false;
-        uvc_source_set_network_ready(false);
         update_power_save();
         s_fail_count++;
         ESP_LOGW(TAG, "Disconnected (reason %d), attempt %u, retry in %u ms",
@@ -72,7 +70,6 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         s_fail_count = 0;
         s_retry_delay_ms = RETRY_DELAY_MIN_MS;
         update_power_save();
-        uvc_source_set_network_ready(true);
     }
 }
 

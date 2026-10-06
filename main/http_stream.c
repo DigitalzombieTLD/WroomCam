@@ -2,7 +2,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "http_stream.h"
-#include "uvc_source.h"
+#include "camera_source.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "http";
@@ -20,16 +20,16 @@ static esp_err_t index_handler(httpd_req_t *req)
     return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
 }
 
-static bool valid_jpeg(const uvc_host_frame_t *f)
+static bool valid_jpeg(const camera_fb_t *f)
 {
-    return f->data_len > 4 && f->data[0] == 0xFF && f->data[1] == 0xD8;
+    return f->format == PIXFORMAT_JPEG && f->len > 4 && f->buf[0] == 0xFF && f->buf[1] == 0xD8;
 }
 
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     // esp_http_server runs handlers on one task, so this serves a single viewer at a time;
     // further connections queue until the current stream ends.
-    ESP_LOGI(TAG, "Stream client connected; starting camera on demand");
+    ESP_LOGI(TAG, "Stream client connected");
     httpd_resp_set_type(req, CONTENT_TYPE);
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -38,10 +38,9 @@ static esp_err_t stream_handler(httpd_req_t *req)
     unsigned sent = 0;
     int idle_ms = 0;
     wifi_manager_set_streaming(true);
-    uvc_source_set_consumer(true);
 
     while (err == ESP_OK) {
-        uvc_host_frame_t *frame = uvc_source_get_frame(pdMS_TO_TICKS(WAIT_SLICE_MS));
+        camera_fb_t *frame = camera_source_get_frame(pdMS_TO_TICKS(WAIT_SLICE_MS));
         if (!frame) {
             idle_ms += WAIT_SLICE_MS;
             if (idle_ms >= CONFIG_WROOMCAM_HTTP_FRAME_WAIT_S * 1000) {
@@ -56,17 +55,16 @@ static esp_err_t stream_handler(httpd_req_t *req)
             char hdr[128];
             int n = snprintf(hdr, sizeof(hdr),
                              "%s--" BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                             sent ? "\r\n" : "", (unsigned)frame->data_len);
+                             sent ? "\r\n" : "", (unsigned)frame->len);
             err = httpd_resp_send_chunk(req, hdr, n);
             if (err == ESP_OK) {
-                err = httpd_resp_send_chunk(req, (const char *)frame->data, frame->data_len);  // zero copy
+                err = httpd_resp_send_chunk(req, (const char *)frame->buf, frame->len);
             }
             sent++;
         }
-        uvc_source_release_frame(frame);
+        camera_source_release_frame(frame);
     }
 
-    uvc_source_set_consumer(false);
     wifi_manager_set_streaming(false);
     ESP_LOGI(TAG, "Stream client gone (%u frames sent, %s)", sent, esp_err_to_name(err));
     return err == ESP_OK ? httpd_resp_send_chunk(req, NULL, 0) : ESP_FAIL;
